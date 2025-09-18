@@ -42,3 +42,113 @@ Install our GitHub app from your [dashboard](https://dashboard.mintlify.com/sett
 ### Resources
 
 - [Mintlify documentation](https://mintlify.com/docs)
+
+\`\`\`mermaid
+
+sequenceDiagram
+
+    autonumber
+
+    participant App as DivvyWatch App
+
+    participant Bill as [Bill.com](http://Bill.com) API
+
+    participant DB as UFLIP DB
+
+    participant Discord as Discord
+
+    Note over App: Application start
+
+    %% Initialization
+
+    App-\>\>App: Get Public IP
+
+    App-\>\>App: Validate Environment Variables
+
+    App-\>\>App: Initialize [Bill.com](http://Bill.com) API
+
+    App-\>\>App: Initialize UFLIP API
+
+    App-\>\>App: Initialize Discord API
+
+    loop Polling loop (continuous)
+
+        App-\>\>App: Set Transaction Date Range\<br\>(Default: Today)
+
+        App-\>\>Bill: Get new transactions
+
+        Bill--\>\>App: Return transactions
+
+        App-\>\>DB: Open connection
+
+        loop For each transaction page (up to PAGINATION_MAX_PAGES)
+
+            loop For each transaction
+
+                alt Already Processed
+
+                    App-\>\>App: Skip transaction
+
+                else New Transaction
+
+                    App-\>\>Bill: Get card details
+
+                    alt Status: Credit
+
+                        App-\>\>Discord: Send credit alert
+
+                    else Status: Declined
+
+                        App-\>\>Discord: Send declined alert
+
+                    else Status: Authorized or Posted
+
+                        alt Foreign transaction: Yes
+
+                            App-\>\>DB: Search confirmed foreign purchases
+
+                            Note over DB: Match on last4, card type, country, amount and date
+
+                            DB--\>\>App: Return purchases
+
+                        else Foreign transaction: No
+
+                            App-\>\>DB: Search confirmed purchases
+
+                            Note over DB: Match on last4, card type, amount, and date
+
+                            DB--\>\>App: Return purchases
+
+                        end
+
+                        alt No purchases found
+
+                            App-\>\>Bill: Block card
+
+                            Bill--\>\>App: Return result
+
+                            App-\>\>Discord: Send unapproved purchase alert
+
+                        end
+
+                    end
+
+                    App-\>\>App: Update In Memory Cache\<br/\>with Transaction id
+
+                    Note over App: Sleep 100ms before next transaction
+
+                end
+
+            end
+
+            Note over App: Sleep PAGINATION_INTERVAL_MS before next page
+
+        end
+
+        App-\>\>DB: Close connection
+
+        Note over App: Sleep POLL_INTERVAL_MS before next poll
+
+    end
+
+\`\`\`
