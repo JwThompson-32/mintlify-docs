@@ -1,0 +1,116 @@
+service.bot.divvywatch
+A Node.js service that polls Divvy Card transactions, normalizes and verifies them against confirmed purchases, auto‑blocks cards and sends high‑urgency Discord embed alerts for unapproved activity. Supports foreign transactions, credits/declines, configurable tolerances and FX conversion.
+
+Architecture
+The DivvyWatch service is a small Node.js daemon that continuously polls Divvy Card transactions, verifies them against confirmed purchases in the UFLIP database, optionally blocks suspicious cards via the Bill.com API, and sends high‑urgency alerts to a configured Discord webhook.
+
+Key components
+
+DivvvyWatch App (Node.js): main process that coordinates polling, validation and alerting (implemented in app/main.js).
+Bill.com API adapter: responsible for searching real‑time transactions and blocking cards.
+UFLIP API adapter: queries the UFLIP Postgres store for confirmed purchases used to validate transactions.
+Discord webhook adapter: sends embed alerts to a configured Discord channel for credits, declines and unapproved activity.
+Logger: structured logging used throughout the application to capture info, success and error events.
+Configuration: environment variables (see "Environment Variables & Secrets") control credentials, polling interval, and whether blocking is enabled.
+Deployment
+
+The project is intended to run inside a container (Dev Containers / Docker) or as an Nhost service. The ./run CLI is used for local dev and Nhost deployments.
+Application Process
+The application follows a simple, resilient loop designed for continuous monitoring and low blast‑radius on errors.
+
+Initialization
+Validate required environment variables (throws and aborts if missing).
+Initialize APIs/adapters: Bill.com, UFLIP DB, and Discord.
+Configure logging level and read runtime options (poll interval, block card flag, optional date window).
+Main processing loop
+Continuously poll the Bill.com API for card transactions for the configured date range.
+The app opens a database connection once per polling cycle, fetches transactions in paginated batches (up to PAGINATION_MAX_PAGES), processes each batch, and closes the connection. Sleeps (PAGINATION_INTERVAL_MS) occur between pages to respect API rate limits.
+Transaction handling (per transaction)
+For each transaction, the app fetches card details from Bill.com (to enrich data like last four digits and cardholder name)
+It uses an in-memory FIFO cache (limited to 1000 entries) to skip already-processed transactions.
+Sleeps (100ms) occur between transactions to avoid rate limits. If no matching purchase is found, the card is blocked (if enabled) and a Discord alert is sent.
+Branch by status:
+credit: log and send a credit notice to Discord.
+declined: log and send a declined notice to Discord.
+authorized or posted: perform verification against UFLIP purchases.
+If is_foreign is true, search confirmed purchases by last4, card type, country and date range.
+If is_foreign is false, search confirmed purchases by last4, amount, card type and date range.
+If no confirmed purchase is found, optionally block the card via the Bill.com API and send an "unapproved transaction" alert to Discord.
+Error handling
+The main loop and transaction handlers catch and log errors. Initialization errors are treated as fatal and stop the process.
+Network or API problems are logged with stack traces when available; any non‑fatal errors do not crash the continuous poll loop.
+Notifications
+Alerts include structured fields (card, status, amounts, merchant, MCC info, transaction id, approval code) to make triage straightforward.
+Operational notes
+
+Poll interval is controlled by POLL_INTERVAL_MS (defaults to 300000 ms / 5 minutes).
+Card blocking is enabled when BLOCK_CARD_ENABLED=true; otherwise the app will only send alerts.
+Bill.com Transactions API endpoint uses Central Time (CT) for search operations.
+The app converts local CT transaction windows to UTC ISO before querying the UFLIP API to ensure consistent time filtering.
+Processed transaction IDs are cached in memory (FIFO, max 1000) to prevent reprocessing.
+Sleeps are used liberally: 100ms between transactions, PAGINATION_INTERVAL_MS between pages, and 1s after Discord sends.
+See app/main.js for implementation details and exact DTO shapes used to communicate with the Bill.com and UFLIP adapters.
+
+The Mermaid sequence diagram below visualizes this process, showing the interactions between the App, Bill.com, UFLIP, and Discord APIs.
+
+Workflow Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as DivvyWatch App
+    participant Bill as Bill.com API
+    participant DB as UFLIP DB
+    participant Discord as Discord
+
+    Note over App: Application start
+
+    %% Initialization
+    App->>App: Get Public IP
+    App->>App: Validate Environment Variables
+    App->>App: Initialize Bill.com API
+    App->>App: Initialize UFLIP API
+    App->>App: Initialize Discord API
+
+    loop Polling loop (continuous)
+        App->>App: Set Transaction Date Range<br>(Default: Today)
+        App->>Bill: Get new transactions
+        Bill-->>App: Return transactions
+        App->>DB: Open connection
+
+        loop For each transaction page (up to PAGINATION_MAX_PAGES)
+            loop For each transaction
+                alt Already Processed
+                    App->>App: Skip transaction
+                else New Transaction
+                    App->>Bill: Get card details
+                    alt Status: Credit
+                        App->>Discord: Send credit alert
+                    else Status: Declined
+                        App->>Discord: Send declined alert
+                    else Status: Authorized or Posted
+                        alt Foreign transaction: Yes
+                            App->>DB: Search confirmed foreign purchases
+                            Note over DB: Match on last4, card type, country, amount and date
+                            DB-->>App: Return purchases
+                        else Foreign transaction: No
+                            App->>DB: Search confirmed purchases
+                            Note over DB: Match on last4, card type, amount, and date
+                            DB-->>App: Return purchases
+                        end
+                        alt No purchases found
+                            App->>Bill: Block card
+                            Bill-->>App: Return result
+                            App->>Discord: Send unapproved purchase alert
+                        end
+                    end
+                    App->>App: Update In Memory Cache<br/>with Transaction id
+                    Note over App: Sleep 100ms before next transaction
+                end
+            end
+            Note over App: Sleep PAGINATION_INTERVAL_MS before next page
+        end
+        App->>DB: Close connection
+        Note over App: Sleep POLL_INTERVAL_MS before next poll
+    end
+```
